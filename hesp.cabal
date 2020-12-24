@@ -29,6 +29,7 @@ library
                     Network.HESP.TCP
                     Network.HESP.Types
                     Network.NewHESP.Types
+                    Network.NewHESP.Util
   hs-source-dirs:   src
   build-depends:    base            >= 4.11 && < 5
                   , bytestring      ^>= 0.10

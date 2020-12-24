@@ -6,7 +6,7 @@ import Criterion.Main
 import qualified Data.ByteString as BS
 import Data.Char (ord)
 import qualified Data.Vector as V
-import Network.NewHESP.Types
+import Network.NewHESP.Util
 
 main :: IO ()
 main = tmain
@@ -31,10 +31,10 @@ main = tmain
 -- mkArray x y =
 --   let k = fromIntegral $ ord 'x'
 --    in HESP.mkArray $! V.replicate y $! HESP.mkBulkString $! BS.replicate x k
--- 
+--
 -- encodeArray :: Int -> Int -> BS.ByteString
 -- encodeArray x y = HESP.serialize $! mkArray x y
--- 
+--
 -- decodeArray :: BS.ByteString -> HESP.Message
 -- decodeArray bs = head $ do
 --   e_m <- (V.! 0) <$> HESP.deserializeWith [bs] ""
