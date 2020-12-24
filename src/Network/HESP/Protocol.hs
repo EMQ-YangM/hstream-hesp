@@ -1,230 +1,141 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
-module Network.HESP.Protocol
-  ( serialize,
-    deserialize,
-    deserializeWith,
-    deserializeWithMaybe,
-  )
-where
+module Network.HESP.Protocol (encode, decode, decodes, mParser, msParser) where
 
 import Control.Monad (replicateM)
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as BS
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import Data.Vector (Vector)
-import qualified Data.Vector as V
+import Data.Word (Word8)
 import Network.HESP.Types (Message (..))
-import qualified Network.HESP.Types as T
-import Network.HESP.Utils (pairs)
-import qualified Scanner as P
+import Z.Data.Builder
+  ( Builder,
+    bytes,
+    char7,
+    int,
+    integer,
+    string7,
+  )
+import qualified Z.Data.Parser as P
+import qualified Z.Data.Vector as V
+import Z.Data.Vector.Base (Bytes, traverseVec_)
+import Z.Data.Vector.FlatMap as M (FlatMap (..), pack, size)
 
--------------------------------------------------------------------------------
+encode :: Message -> Builder ()
+encode (SimpleString b) = char7 '+' <> bytes b <> sep
+encode (BulkString bs) = char7 '$' <> int (V.length bs) <> sep <> bytes bs <> sep
+encode (SimpleError et em) = char7 '-' <> bytes et <> char7 ' ' <> bytes em <> sep
+encode (Integer i) = char7 ':' <> integer i <> sep
+encode (Array vm) = char7 '*' <> int (V.length vm) <> sep <> mapM_ encode vm
+encode (Boolean b) = if b then string7 "#t" <> sep else string7 "#f" <> sep
+encode (Push bs vm) =
+  char7 '>' <> int (V.length vm + 1) <> sep
+    <> char7 '$'
+    <> int (V.length bs)
+    <> sep
+    <> bytes bs
+    <> sep
+    <> mapM_ encode vm
+encode (Map m) = do
+  char7 '%'
+  int (size m)
+  sep
+  traverseVec_ (\(k, v) -> encode k <> encode v) (sortedKeyValues m)
 
-serialize :: Message -> ByteString
-serialize (MatchSimpleString bs) = serializeSimpleString bs
-serialize (MatchBulkString bs) = serializeBulkString bs
-serialize (MatchSimpleError t m) = serializeSimpleError t m
-serialize (Boolean b) = serializeBoolean b
-serialize (Integer i) = serializeInteger i
-serialize (MatchArray xs) = serializeArray xs
-serialize (MatchPush x xs) = serializePush x xs
-serialize (MatchMap x) = serializeMap x
-
--- | Deserialize the complete input, without resupplying.
-deserialize :: ByteString -> Either String Message
-deserialize = P.scanOnly parser
-
--- | Deserialize with the provided resupply action.
-deserializeWith ::
-  Monad m =>
-  -- | resupply action
-  m ByteString ->
-  -- | input
-  ByteString ->
-  m (Vector (Either String Message))
-deserializeWith = flip runScanWith parser
-
-deserializeWithMaybe ::
-  Monad m =>
-  -- | resupply action
-  m (Maybe ByteString) ->
-  -- | initial input, can be null
-  ByteString ->
-  m (Vector (Either String Message))
-deserializeWithMaybe = flip runScanWithMaybe parser
-
--------------------------------------------------------------------------------
--- Serialize
-
-serializeSimpleString :: ByteString -> ByteString
-serializeSimpleString bs = BS.cons '+' bs <> sep
-
-serializeBulkString :: ByteString -> ByteString
-serializeBulkString bs = BS.cons '$' $ len <> sep <> bs <> sep
-  where
-    len = pack $ BS.length bs
-
-serializeSimpleError :: ByteString -> ByteString -> ByteString
-serializeSimpleError errtype errmsg = BS.concat ["-", errtype, " ", errmsg, sep]
-
-serializeBoolean :: Bool -> ByteString
-serializeBoolean True = BS.cons '#' $ "t" <> sep
-serializeBoolean False = BS.cons '#' $ "f" <> sep
-
-serializeInteger :: Integer -> ByteString
-serializeInteger i = BS.cons ':' $ pack i <> sep
-
-serializeArray :: Vector Message -> ByteString
-serializeArray ms =
-  let len = pack $ V.length ms
-   in BS.cons '*' $ len <> sep <> encodeVectorMsgs ms
-
-serializePush :: ByteString -> Vector Message -> ByteString
-serializePush t ms =
-  let len = pack $ V.length ms + 1
-      pushType = serializeBulkString t
-   in BS.cons '>' $ len <> sep <> pushType <> encodeVectorMsgs ms
-
-serializeMap :: Map Message Message -> ByteString
-serializeMap m =
-  let len = pack $ Map.size m -- N.B. The size must not exceed maxBound::Int
-      eles = V.fromList $ concatMap (\(k, v) -> [k, v]) (Map.toList m)
-   in BS.cons '%' $ len <> sep <> encodeVectorMsgs eles
-
--- __Warning__: working on large messages could be very inefficient.
-encodeVectorMsgs :: Vector Message -> ByteString
-encodeVectorMsgs = BS.concat . V.toList . V.map serialize
-
-sep :: ByteString
+sep :: Builder ()
 sep = "\r\n"
 
-pack :: (Show a) => a -> ByteString
-pack = BS.pack . show
+decode :: Bytes -> (Bytes, Either P.ParseError Message)
+decode = P.parse mParser
 
--------------------------------------------------------------------------------
--- Deserialize
+decodes :: Bytes -> (Bytes, Either P.ParseError [Message])
+decodes = P.parse msParser
 
-parser :: P.Scanner Message
-parser = do
-  c <- P.anyChar8
-  case c of
-    '+' -> T.mkSimpleStringUnsafe <$> str
-    '$' -> T.mkBulkString <$> fixedstr
-    '-' -> uncurry T.mkSimpleError <$> err
-    '#' -> T.Boolean <$> bool
-    ':' -> T.Integer <$> integer
-    '*' -> T.mkArray <$> array
-    '>' -> uncurry T.mkPush <$> push
-    '%' -> T.mkMap <$> dict
-    _ -> fail $ BS.unpack $ "Unknown type: " `BS.snoc` c
+msParser :: P.Parser [Message]
+msParser = do
+  e <- P.atEnd
+  if e
+    then return []
+    else do
+      v <- mParser
+      vs <- msParser
+      return $ v : vs
 
-array :: P.Scanner (Vector Message)
-array = do
-  len <- decimal
-  V.replicateM len parser
-{-# INLINE array #-}
+mParser :: P.Parser Message
+mParser = do
+  firstWord <- P.decodePrim @Word8
+  case firstWord of
+    43 -> pSimpString
+    36 -> pBulkString
+    45 -> pSimpError
+    35 -> pBoolean
+    58 -> pInteger
+    42 -> pArray
+    62 -> pPush
+    37 -> pMap
+    _ -> fail "unknow message type"
 
-push :: P.Scanner (ByteString, Vector Message)
-push = do
-  len <- decimal
-  if len >= 2
-    then do
-      ms <- V.replicateM len parser
-      case V.head ms of
-        MatchBulkString s -> return (s, V.tail ms)
-        _ -> fail "Invalid type"
-    else fail $ "Invalid length of push type: " <> show len
-{-# INLINE push #-}
+pSimpString :: P.Parser Message
+pSimpString = do
+  v <- P.takeWhile (/= 13)
+  eol
+  return (SimpleString v)
 
-dict :: P.Scanner (Map Message Message)
-dict = do
-  len <- decimal
-  kvs <- pairs <$> replicateM (len * 2) parser
-  return $ Map.fromList kvs
-{-# INLINE dict #-}
+pBulkString :: P.Parser Message
+pBulkString = do
+  len <- P.int :: P.Parser Int
+  eol
+  v <- P.take len
+  eol
+  return (BulkString v)
 
--- | Parse a non-negative decimal number in ASCII. For example, @10\r\n@
-decimal :: Integral n => P.Scanner n
-decimal = P.decimal <* eol
-{-# INLINE decimal #-}
+pSimpError :: P.Parser Message
+pSimpError = do
+  et <- P.takeWhile (/= 32)
+  P.skipWord8
+  em <- P.takeWhile (/= 13)
+  eol
+  return (SimpleError et em)
 
--- | Parse a signed integer.
---
--- >>> P.scanOnly integer "1\r\n"
--- Right 1
--- >>> P.scanOnly integer "-1.1\r\n"
--- Right (-1)
-integer :: P.Scanner Integer
-integer = do
-  i <- str
-  case BS.readInteger i of
-    Just (l, _) -> return l
-    Nothing -> fail "Not an integer"
-{-# INLINE integer #-}
+pBoolean :: P.Parser Message
+pBoolean = do
+  v <- P.decodePrim @Word8
+  eol
+  case v of
+    102 -> return $ Boolean False
+    116 -> return $ Boolean True
+    _ -> fail "boolean value error"
 
-bool :: P.Scanner Bool
-bool = b <* eol
-  where
-    b = do
-      c <- P.anyChar8
-      case c of
-        't' -> return True
-        _ -> return False
-{-# INLINE bool #-}
+pInteger :: P.Parser Message
+pInteger = do
+  v <- P.integer
+  eol
+  return $ Integer v
 
-str :: P.Scanner ByteString
-str = P.takeWhileChar8 (/= '\r') <* eol
-{-# INLINE str #-}
+pArray :: P.Parser Message
+pArray = do
+  len <- P.int :: P.Parser Int
+  eol
+  v <- replicateM len mParser
+  return (Array (V.pack v))
 
-fixedstr :: P.Scanner ByteString
-fixedstr = do
-  len <- decimal
-  P.take len <* eol
-{-# INLINE fixedstr #-}
+pPush :: P.Parser Message
+pPush = do
+  len <- P.int :: P.Parser Int
+  eol
+  (BulkString h) : t <- replicateM len mParser
+  return $ Push h (V.pack t)
 
-err :: P.Scanner (ByteString, ByteString)
-err = do
-  errtype <- word
-  errmsg <- str
-  return (errtype, errmsg)
-{-# INLINE err #-}
+pMap :: P.Parser Message
+pMap = do
+  len <- P.int :: P.Parser Int
+  eol
+  vs <- replicateM (2 * len) mParser
+  let temp = group2 vs
+  return $ Map $ M.pack temp
 
-word :: P.Scanner ByteString
-word = P.takeWhileChar8 (/= ' ') <* P.skipSpace
-{-# INLINE word #-}
-
-eol :: P.Scanner ()
+eol :: P.Parser ()
 eol = P.char8 '\r' *> P.char8 '\n'
-{-# INLINE eol #-}
 
--------------------------------------------------------------------------------
-
-runScanWith ::
-  Monad m =>
-  m ByteString ->
-  P.Scanner a ->
-  ByteString ->
-  m (Vector (Either String a))
-runScanWith more = runScanWithMaybe (Just <$> more)
-
-runScanWithMaybe ::
-  Monad m =>
-  m (Maybe ByteString) ->
-  P.Scanner a ->
-  ByteString ->
-  m (Vector (Either String a))
-runScanWithMaybe more s input = go (Just input) scanner V.empty
-  where
-    scanner = P.scan s
-    -- FIXME: more efficiently
-    go Nothing _ sums = return sums
-    go (Just bs) next sums =
-      case next bs of
-        P.More next' -> more >>= \bs' -> go bs' next' sums
-        P.Done rest r ->
-          if BS.null rest
-            then return $ V.snoc sums (Right r)
-            else go (Just rest) scanner $! V.snoc sums (Right r)
-        P.Fail _ errmsg -> return $ V.snoc sums (Left errmsg)
+group2 :: [a] -> [(a, a)]
+group2 [] = []
+group2 (a : b : xs) = (a, b) : group2 xs
+group2 _ = error "strange happened"

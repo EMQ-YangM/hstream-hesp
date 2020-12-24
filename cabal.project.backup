@@ -1,8 +1,0 @@
-packages: .
-
-source-repository-package
-  type: git
-  location: https://github.com/haskell-Z/z-io.git
-  tag: 95a4c38ea3ed472fb5c7e7c99f127fef65f5257e
-  --sha256: 1kgvyj7c5x24161na501qbwxskrash6q0k4zyaxfxmmc7z148ikc
-
