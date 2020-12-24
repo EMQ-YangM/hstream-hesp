@@ -1,11 +1,13 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Network.NewHESP.Types where
 
 import Control.Monad (forM, replicateM)
 import Criterion.Main
 import qualified Data.ByteString as B
+import Data.Word (Word8)
 import qualified Network.HESP.Protocol as H
 import Test.QuickCheck
   ( Arbitrary (arbitrary),
@@ -29,7 +31,6 @@ import qualified Z.Data.Vector as V
 import Z.Data.Vector.Base (Bytes, Vector, traverseVec_, w2c)
 import Z.Data.Vector.FlatMap as M (FlatMap (..), pack, size)
 import qualified Z.IO.FileSystem as F
-import           Criterion.Main
 
 -- | redis protocol message,
 -- In RESP different parts of the protocol are always terminated with "\r\n" (CRLF).
@@ -62,10 +63,10 @@ instance Arbitrary Message where
               (1, BulkString <$> fmap filter2 arbitrary),
               (1, SimpleError <$> fmap filter3 arbitrary <*> fmap filter3 arbitrary),
               (1, Integer <$> arbitrary),
-              (10, Array <$> clist),
-              (0, Boolean <$> arbitrary),
-              (0, Push <$> arbitrary <*> clist),
-              (0, Map <$> cmap)
+              (1, Array <$> clist),
+              (1, Boolean <$> arbitrary),
+              (1, Push <$> arbitrary <*> clist),
+              (1, Map <$> cmap)
             ]
         | n <= 0 = f
         where
@@ -117,61 +118,84 @@ sep = "\r\n"
 
 decode :: P.Parser Message
 decode = do
-  firstWord <- P.peek
-  case w2c firstWord of
-    '+' -> do
-      P.skipWord8
-      v <- P.takeWhile ((/= '\r') . w2c)
-      eol
-      return (SimpleString v)
-    '$' -> do
-      P.skipWord8
-      len <- P.int :: P.Parser Int
-      eol
-      v <- P.take len
-      eol
-      return (BulkString v)
-    '-' -> do
-      P.skipWord8
-      et <- P.takeWhile ((/= ' ') . w2c)
-      P.skipWord8
-      em <- P.takeWhile ((/= '\r') . w2c)
-      eol
-      return (SimpleError et em)
-    '#' -> do
-      P.skipWord8
-      v <- P.peek
-      P.skipWord8
-      eol
-      case w2c v of
-        'f' -> return $ Boolean False
-        't' -> return $ Boolean True
-        _ -> error "boolean value error"
-    ':' -> do
-      P.skipWord8
-      v <- P.integer
-      eol
-      return $ Integer v
-    '*' -> do
-      P.skipWord8
-      len <- P.int :: P.Parser Int
-      eol
-      v <- replicateM len decode
-      return (Array (V.pack v))
-    '>' -> do
-      P.skipWord8
-      len <- P.int :: P.Parser Int
-      eol
-      (BulkString h) : t <- replicateM len decode
-      return $ Push h (V.pack t)
-    '%' -> do
-      P.skipWord8
-      len <- P.int :: P.Parser Int
-      eol
-      vs <- replicateM (2 * len) decode
-      let temp = group2 vs
-      return $ Map $ M.pack temp
+  firstWord <- P.decodePrim @Word8
+  case firstWord of
+    43 -> pSimpString
+    36 -> pBulkString
+    45 -> pSimpError
+    35 -> pBoolean
+    58 -> pInteger
+    42 -> pArray
+    62 -> pPush
+    37 -> pMap
     _ -> error "strange happened"
+
+pSimpString :: P.Parser Message
+pSimpString = do
+  v <- P.takeWhile (/= 13)
+  eol
+  return (SimpleString v)
+{-# INLINE pSimpString #-}
+
+pBulkString :: P.Parser Message
+pBulkString = do
+  len <- P.int :: P.Parser Int
+  eol
+  v <- P.take len
+  eol
+  return (BulkString v)
+{-# INLINE pBulkString #-}
+
+pSimpError :: P.Parser Message
+pSimpError = do
+  et <- P.takeWhile (/= 32)
+  P.skipWord8
+  em <- P.takeWhile (/= 13)
+  eol
+  return (SimpleError et em)
+{-# INLINE pSimpError #-}
+
+pBoolean :: P.Parser Message
+pBoolean = do
+  v <- P.decodePrim @Word8
+  eol
+  case v of
+    102 -> return $ Boolean False
+    116 -> return $ Boolean True
+    _ -> error "boolean value error"
+{-# INLINE pBoolean #-}
+
+pInteger :: P.Parser Message
+pInteger = do
+  v <- P.integer
+  eol
+  return $ Integer v
+{-# INLINE pInteger #-}
+
+pArray :: P.Parser Message
+pArray = do
+  len <- P.int :: P.Parser Int
+  eol
+  v <- replicateM len decode
+  return (Array (V.pack v))
+{-# INLINE pArray #-}
+
+pPush :: P.Parser Message
+pPush = do
+  len <- P.int :: P.Parser Int
+  eol
+  (BulkString h) : t <- replicateM len decode
+  return $ Push h (V.pack t)
+{-# INLINE pPush #-}
+
+pMap :: P.Parser Message
+pMap = do
+  len <- P.int :: P.Parser Int
+  eol
+  vs <- replicateM (2 * len) decode
+  let temp = group2 vs
+  return $ Map $ M.pack temp
+{-# INLINE pMap #-}
 
 eol :: P.Parser ()
 eol = P.char8 '\r' *> P.char8 '\n'
@@ -219,10 +243,3 @@ tmain =
     [ bench "fr" $ nfIO fr,
       bench "fh" $ nfIO fh
     ]
-
--- let v1 = build $ (encode v <> encode va)
--- case P.parse decode v1 of
---   (_, Left e) -> print e
---   (l, Right v) -> do
---     print v
---     print $ P.parse decode l
